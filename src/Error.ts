@@ -2,7 +2,9 @@
 export class WebDeviceMuxError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = this.constructor.name;
+    // Not this.constructor.name: a minifier rewrites class names, and
+    // consumers matching on err.name would silently stop matching.
+    this.name = 'WebDeviceMuxError';
   }
 }
 
@@ -13,7 +15,7 @@ export class DeviceConnectionError extends WebDeviceMuxError {
     this.innerException = innerException;
   }
 
-  innerException?: Error;
+  innerException?: Error | undefined;
 }
 
 /** Error indicating communication with the device failed. */
@@ -23,12 +25,15 @@ export class DeviceCommunicationError extends WebDeviceMuxError {
     this.innerException = innerException;
   }
 
-  innerException?: Error;
+  innerException?: Error | undefined;
 }
 
 /** Error indicating the device was not ready to communicate. */
 export class DeviceNotReadyError extends DeviceCommunicationError {
   constructor(message?: string, innerException?: Error) {
-    super(message ?? innerException?.message ?? 'Device not ready to communicate.');
+    // innerException must be forwarded. Dropping it left every
+    // DeviceNotReadyError with an undefined cause, so consumers logging
+    // error.innerException got nothing at exactly the moment they needed it.
+    super(message ?? innerException?.message ?? 'Device not ready to communicate.', innerException);
   }
 }
