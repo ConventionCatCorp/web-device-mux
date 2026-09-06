@@ -57,6 +57,8 @@ function fakeDevice(opts: FakeOptions = {}) {
     { alternate: bulk, claimed: false, interfaceNumber, alternates: [bulk] },
   ];
 
+  const state = { opened: false };
+
   const dev = {
     manufacturerName: 'Test', productName: 'Printer', serialNumber: '1',
     configuration: null,
@@ -65,12 +67,12 @@ function fakeDevice(opts: FakeOptions = {}) {
     vendorId: 0x04b8, productId: 0x0202,
     deviceVersionMajor: 1, deviceVersionMinor: 0, deviceVersionSubminor: 0,
     configurations: [{ configurationName: 'cfg', configurationValue, interfaces }],
-    opened: false,
-    open: () => { dev.opened = true; return Promise.resolve(); },
+    get opened() { return state.opened; },
+    open: () => { state.opened = true; return Promise.resolve(); },
     close: () => {
       calls.closed++;
       if (opts.closeError) { return Promise.reject(opts.closeError); }
-      dev.opened = false;
+      state.opened = false;
       return Promise.resolve();
     },
     forget: () => Promise.resolve(),

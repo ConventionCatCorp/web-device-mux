@@ -3,6 +3,9 @@ export function isManageableDevice(
   device: USBDevice,
   requestOptions: USBDeviceRequestOptions
 ): boolean {
+  // The type marks filters as required, but this is caller-supplied data that
+  // reaches us from plain JS, so the guard is load-bearing at runtime.
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
   const filters = requestOptions.filters ?? [];
   const exclusionFilters = requestOptions.exclusionFilters ?? [];
 

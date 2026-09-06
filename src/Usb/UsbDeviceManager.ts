@@ -125,7 +125,7 @@ export class UsbDeviceManager<TDevice extends IDevice> extends EventTarget {
   public override removeEventListener(
     type: string,
     callback: EventListenerOrEventListenerObject | null,
-    options?: boolean | EventListenerOptions | undefined
+    options?: boolean | EventListenerOptions  
   ): void {
       super.removeEventListener(type, callback, options);
   }

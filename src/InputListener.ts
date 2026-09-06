@@ -183,7 +183,7 @@ export class InputMessageListener<TInput> {
     private readonly _dataProvider: DataProvider<TInput>,
     private readonly _inputHandler: InputHandler<TInput>,
     private readonly _errorHandler: InputErrorHandler,
-    private readonly _debugLogging: boolean = true, // TODO: false
+    private readonly _debugLogging = true, // TODO: false
   ) {}
 
   private logIfDebug(...obj: unknown[]) {

@@ -118,7 +118,9 @@ export class UsbDeviceChannel implements IDeviceChannel<Uint8Array, Uint8Array> 
 
       this.deviceIn = input;
       this.deviceOut = output;
-      this._commMode = getCommMode(this.deviceOut !== undefined, this.deviceIn !== undefined);
+      // connectDevice throws unless it found an output endpoint, so output is
+      // always present here; only input is genuinely optional.
+      this._commMode = getCommMode(true, this.deviceIn !== undefined);
       if (this._commOptions.debug) {
         console.debug('Comm mode with device is', ConnectionDirectionMode[this._commMode]);
       }
@@ -202,7 +204,7 @@ export class UsbDeviceChannel implements IDeviceChannel<Uint8Array, Uint8Array> 
       ) {
         await this.device.transferOut(this.deviceOut.endpointNumber, new Uint8Array(0));
       }
-      return;
+      return undefined;
     } catch (e: unknown) {
       if (typeof e === 'string') {
         return new DeviceCommunicationError(e);
@@ -231,7 +233,7 @@ export class UsbDeviceChannel implements IDeviceChannel<Uint8Array, Uint8Array> 
       this.deviceIn.endpointNumber,
       getTransferLength(
         this._commOptions.maxReceivePacketSize,
-        this.deviceIn?.packetSize,
+        this.deviceIn.packetSize,
       ),
     )
     .catch((error: unknown) => {
@@ -391,9 +393,9 @@ async function connectDevice(d: USBDevice) {
   let o: USBEndpoint | undefined = undefined;
   let i: USBEndpoint | undefined = undefined;
   for (const endpoint of endpoints) {
-    if (endpoint.direction == 'out') {
+    if (endpoint.direction === 'out') {
       o = endpoint;
-    } else if (endpoint.direction == 'in') {
+    } else {
       i = endpoint;
     }
   }
@@ -422,7 +424,7 @@ if (import.meta.vitest) {
       const badDevice: USBDevice = {
         configurations: []
       } as unknown as USBDevice;
-      await expect(() => connectDevice(badDevice)).rejects.toThrowError();
+      await expect(() => connectDevice(badDevice)).rejects.toThrow();
     });
 
     it('Throws on access denied', async () => {
@@ -456,11 +458,11 @@ if (import.meta.vitest) {
 function getCommMode(output: boolean, input: boolean) {
   // TODO: Figure out if getting the Interface Protocol Mode is more
   // reliable than the detection method used here...
-  if (output === false) {
+  if (!output) {
     // Can't talk to something that isn't listening...
     return ConnectionDirectionMode.none;
   }
-  if (input === false) {
+  if (!input) {
     // Can send commands but can't get info back. Operating in the blind.
     return ConnectionDirectionMode.unidirectional;
   }

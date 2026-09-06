@@ -13,7 +13,7 @@ type deviceThrows
 
 function getFakeDevice(
   throws: deviceThrows = 'none',
-  input: string = 'hello'
+  input = 'hello'
 ): USBDevice {
   const dev: USBDevice = {
     manufacturerName: 'test',
@@ -146,7 +146,7 @@ describe('UsbDeviceChannel', () => {
     const dev = getFakeDevice('openSecurity');
     await expect(async () => {
       const channel = await UsbDeviceChannel.fromDevice(dev);
-      channel.dispose();
-    }).rejects.toThrowError(new DriverAccessDeniedError());
+      await channel.dispose();
+    }).rejects.toThrow(new DriverAccessDeniedError());
   });
 });
