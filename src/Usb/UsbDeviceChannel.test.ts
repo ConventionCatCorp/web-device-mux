@@ -16,6 +16,10 @@ function getFakeDevice(
   input: string = 'hello'
 ): USBDevice {
   const dev: USBDevice = {
+    manufacturerName: 'test',
+    productName: 'test',
+    serialNumber: 'test',
+    configuration: null,
     usbVersionMajor: 0,
     usbVersionMinor: 0,
     usbVersionSubminor: 0,
@@ -28,12 +32,14 @@ function getFakeDevice(
     deviceVersionMinor: 0,
     deviceVersionSubminor: 0,
     configurations: [{
+      configurationName: 'test',
       configurationValue: 0,
       interfaces: [{
         alternate: undefined!,
         claimed: false,
         interfaceNumber: 0,
         alternates: [{
+          interfaceName: 'test',
           alternateSetting: 0,
           interfaceClass: 0,
           interfaceProtocol: 1,
