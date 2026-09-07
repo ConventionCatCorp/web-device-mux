@@ -166,4 +166,33 @@ describe('InputMessageListener fault handling', () => {
 
     expect(calls).toBe(0);
   });
+
+  it('counts consecutive faults, not faults over its whole lifetime', async () => {
+    // The retry budget was never reset after a good read, so it was spent
+    // across the listener's lifetime. A device with one recoverable blip an
+    // hour still died, hours later, for no reason it could observe.
+    const goodReads: string[][] = [];
+    let call = 0;
+    const { listener, errorHandler } = makeListener({
+      provider: () => {
+        call++;
+        // Alternate: fault, good read, fault, good read, ... well past the
+        // retry budget. Every fault is separated by a successful read.
+        if (call > 20) {
+          return new Promise(resolve => { setTimeout(() => { resolve([]); }, 1000); });
+        }
+        return Promise.resolve(call % 2 === 1 ? transientError() : ['data']);
+      },
+      handler: (input) => {
+        goodReads.push([...input]);
+        return Promise.resolve({ remainderData: [] } as IHandlerResponse<string>);
+      },
+    });
+
+    listener.start();
+    await vi.waitFor(() => { expect(goodReads.length).toBeGreaterThanOrEqual(8); });
+
+    expect(errorHandler).not.toHaveBeenCalled();
+    listener.dispose();
+  });
 });

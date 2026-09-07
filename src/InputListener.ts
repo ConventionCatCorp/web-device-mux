@@ -113,6 +113,11 @@ export class InputMessageListener<TInput> {
         continue;
       }
 
+      // A good read means the device recovered, so the retry budget counts
+      // consecutive faults. Without this it is spent over the listener's whole
+      // lifetime and a device with one blip an hour eventually stops for good.
+      this._retries = 0;
+
       aggregate.push(...data);
       this.logIfDebug(`Got data from provider, now has ${String(aggregate.length)} items in receive buffer. Data: `, data);
 

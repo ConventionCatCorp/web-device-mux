@@ -64,6 +64,20 @@ export class UsbDeviceManager<TDevice extends IDevice> extends EventTarget {
    */
   private _pending = new Map<USBDevice, Promise<TDevice>>();
 
+  /**
+   * Devices that went away, or whose manager was disposed, while their setup
+   * was still in flight.
+   *
+   * Setup takes tens of milliseconds, and both a disconnect and a dispose can
+   * land inside that window. Neither could see the device, because it is not
+   * in _devices until setup resolves, so the finished channel was tracked and
+   * announced as connected on a device that was already gone - open forever,
+   * with no further disconnect event coming to clean it up.
+   */
+  private _abandoned = new Set<USBDevice>();
+
+  private _disposed = false;
+
   private readonly _onConnect = (e: USBConnectionEvent) => {
     void this.handleConnect(e).catch((error: unknown) => {
       this.sendErrorEvent(e.device, error);
@@ -172,12 +186,20 @@ export class UsbDeviceManager<TDevice extends IDevice> extends EventTarget {
 
   /** Detach this manager's listeners and dispose every device it tracks. */
   public async dispose() {
+    this._disposed = true;
     this.usb.removeEventListener('connect', this._onConnect);
     this.usb.removeEventListener('disconnect', this._onDisconnect);
     const devices = Array.from(this._devices.values());
+    // Setups still running have to be waited on, not just forgotten. Dropping
+    // the reference leaves an open channel that nothing can ever close.
+    const pending = Array.from(this._pending.values());
     this._devices.clear();
     this._pending.clear();
-    await Promise.allSettled(devices.map(d => d.dispose()));
+    this._abandoned.clear();
+    await Promise.allSettled([
+      ...devices.map(d => d.dispose()),
+      ...pending.map(p => p.then(d => d.dispose(), () => undefined)),
+    ]);
   }
 
   /** Handler for device connection events. */
@@ -204,6 +226,15 @@ export class UsbDeviceManager<TDevice extends IDevice> extends EventTarget {
       } finally {
         this._pending.delete(device);
       }
+
+      // The device may have been unplugged, or this manager disposed, while
+      // the setup above was running. Neither could see it then, so clean up
+      // here rather than announcing a device that is already gone.
+      if (this._disposed || this._abandoned.delete(device)) {
+        await dev.dispose().catch(() => { /* already gone */ });
+        return;
+      }
+
       this._devices.set(device, dev);
     }
 
@@ -217,6 +248,10 @@ export class UsbDeviceManager<TDevice extends IDevice> extends EventTarget {
   public async handleDisconnect({ device }: USBConnectionEvent): Promise<void> {
     const dev = this._devices.get(device);
     if (dev === undefined) {
+      // A setup in flight has nothing to dispose yet. Mark it so the connect
+      // path tears it down instead of tracking a device that is already gone;
+      // the browser only fires disconnect once, so this is the only chance.
+      if (this._pending.has(device)) { this._abandoned.add(device); }
       return;
     }
     this._devices.delete(device);

@@ -1,6 +1,6 @@
 import { it, expect, describe, vi } from 'vitest';
 import { DriverAccessDeniedError, UsbDeviceChannel } from './UsbDeviceChannel.js';
-import { DeviceCommunicationError } from '../Error.js';
+import { DeviceCommunicationError, DeviceNotReadyError } from '../Error.js';
 
 interface FakeOptions {
   /** configurationValue reported by the device's single configuration. */
@@ -10,6 +10,8 @@ interface FakeOptions {
   /** Extra interfaces placed BEFORE the bulk one, with no endpoints. */
   decoyInterfaces?: number;
   claimInterfaceError?: DOMException;
+  /** Rejection for transferIn, to exercise receive()'s failure paths. */
+  transferInError?: DOMException;
   selectConfigurationError?: DOMException;
   closeError?: Error;
   outStatus?: USBTransferStatus;
@@ -102,7 +104,9 @@ function fakeDevice(opts: FakeOptions = {}) {
       calls.clearedHalts.push(direction);
       return Promise.resolve();
     },
-    transferIn: () => Promise.resolve({ status: 'ok', data: undefined }),
+    transferIn: () => opts.transferInError
+      ? Promise.reject(opts.transferInError)
+      : Promise.resolve({ status: 'ok', data: undefined }),
     transferOut: (endpoint: number, data: BufferSource) => {
       calls.transfersOut.push({ endpoint, length: data.byteLength });
       return Promise.resolve({
@@ -296,5 +300,22 @@ describe('getTransferLength', () => {
 
     expect(spy).toHaveBeenCalled();
     expect(spy.mock.calls[0]?.[1]).toBeGreaterThan(0);
+  });
+});
+
+describe('UsbDeviceChannel.receive disconnect reporting', () => {
+  // The listener decides a fault is transient by inspecting innerException.
+  // receive() built its error without one, so a bus reset - the case the retry
+  // exists for - was classified fatal and the listener stopped for good.
+  it('forwards the DOMException that ended the transfer', async () => {
+    const transferInError = new DOMException(
+      'A transfer error has occurred.', 'NetworkError');
+    const { dev } = fakeDevice({ transferInError });
+    const channel = await UsbDeviceChannel.fromDevice(dev, { debug: false });
+
+    const result = await channel.receive();
+
+    expect(result).toBeInstanceOf(DeviceNotReadyError);
+    expect((result as DeviceNotReadyError).innerException).toBe(transferInError);
   });
 });

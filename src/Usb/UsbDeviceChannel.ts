@@ -155,7 +155,7 @@ export class UsbDeviceChannel implements IDeviceChannel<Uint8Array, Uint8Array> 
 
   public async send(
     commandBuffer: Uint8Array
-  ): Promise<DeviceNotReadyError | undefined> {
+  ): Promise<DeviceCommunicationError | undefined> {
     if (this.deviceOut === undefined || !this.connected) {
       return new DeviceNotReadyError();
     }
@@ -241,8 +241,10 @@ export class UsbDeviceChannel implements IDeviceChannel<Uint8Array, Uint8Array> 
         && error.message.endsWith('A transfer error has occurred.')
         && error.name === 'NetworkError'
       ){
-        // The device disconnected, this is fine.
-        return new DeviceNotReadyError('Channel has disconnected');
+        // The exception must be forwarded: the input listener classifies a
+        // fault as transient by inspecting innerException, so dropping it here
+        // made every bus reset look fatal and stopped the listener for good.
+        return new DeviceNotReadyError('Channel has disconnected', error);
       }
       // dunno what happened
       throw error;
@@ -488,5 +490,6 @@ export class DriverAccessDeniedError extends DeviceCommunicationError {
     super(
       'Operating system prevented accessing the USB device. If this is on Windows you may need to replace the driver. See https://cellivar.github.io/WebZLP/docs/windows_driver for more details.'
     );
+    this.name = 'DriverAccessDeniedError';
   }
 }
