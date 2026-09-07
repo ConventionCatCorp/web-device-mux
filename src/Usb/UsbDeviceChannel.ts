@@ -25,9 +25,9 @@ function deviceToInfo(device: USBDevice): IUSBDeviceInformation {
     deviceVersionSubminor: device.deviceVersionSubminor,
     productId            : device.productId,
     vendorId             : device.vendorId,
-    manufacturerName     : device.manufacturerName,
-    productName          : device.productName,
-    serialNumber         : device.serialNumber,
+    manufacturerName     : device.manufacturerName ?? undefined,
+    productName          : device.productName ?? undefined,
+    serialNumber         : device.serialNumber ?? undefined,
   };
 }
 
@@ -47,7 +47,10 @@ function getTransferLength(
   let devicePacketSize = devicePacket ?? 64;
   devicePacketSize = devicePacketSize > 0 ? devicePacketSize : 64;
 
-  return devicePacketSize * Math.floor(maxPacket / devicePacketSize);
+  // Never round down to zero. A device with a 1024-byte high-speed bulk IN
+  // endpoint plus a caller-supplied maxReceivePacketSize below that would
+  // otherwise produce transferIn(endpoint, 0), which reads nothing forever.
+  return Math.max(devicePacketSize, devicePacketSize * Math.floor(maxPacket / devicePacketSize));
 }
 
 if (import.meta.vitest) {
@@ -76,8 +79,8 @@ if (import.meta.vitest) {
 /** Class for managing the WebUSB communication with a device. */
 export class UsbDeviceChannel implements IDeviceChannel<Uint8Array, Uint8Array> {
   private device: USBDevice;
-  private deviceIn?: USBEndpoint;
-  private deviceOut?: USBEndpoint;
+  private deviceIn?: USBEndpoint | undefined;
+  private deviceOut?: USBEndpoint | undefined;
 
   private _commOptions: IDeviceCommunicationOptions;
 
@@ -115,7 +118,9 @@ export class UsbDeviceChannel implements IDeviceChannel<Uint8Array, Uint8Array> 
 
       this.deviceIn = input;
       this.deviceOut = output;
-      this._commMode = getCommMode(this.deviceOut !== undefined, this.deviceIn !== undefined);
+      // connectDevice throws unless it found an output endpoint, so output is
+      // always present here; only input is genuinely optional.
+      this._commMode = getCommMode(true, this.deviceIn !== undefined);
       if (this._commOptions.debug) {
         console.debug('Comm mode with device is', ConnectionDirectionMode[this._commMode]);
       }
@@ -132,26 +137,25 @@ export class UsbDeviceChannel implements IDeviceChannel<Uint8Array, Uint8Array> 
 
     this._disposed = true;
 
+    // Disposal must not throw. It runs from three places that cannot handle a
+    // rejection: setup()'s failure path, where a close error would REPLACE the
+    // real diagnosis (exactly the driver-conflict case on Windows); the device
+    // manager's disconnect handler, where a throw means the disconnect event
+    // never fires and the rejection is unhandled; and consumer teardown.
     try {
       await this.device.close();
     } catch (e) {
-      if (
-        e instanceof DOMException &&
-        e.name === 'NotFoundError' &&
-        e.message ===
-        "Failed to execute 'close' on 'USBDevice': The device was disconnected."
-      ) {
-        // Device was already closed, no-op.
-        return;
+      // Matching on the exact English message text is fragile across browser
+      // versions and locales, so treat any close failure as best-effort.
+      if (this._commOptions.debug) {
+        console.debug('Ignoring error while closing the USB device.', e);
       }
-
-      throw e;
     }
   }
 
   public async send(
     commandBuffer: Uint8Array
-  ): Promise<DeviceNotReadyError | undefined> {
+  ): Promise<DeviceCommunicationError | undefined> {
     if (this.deviceOut === undefined || !this.connected) {
       return new DeviceNotReadyError();
     }
@@ -163,8 +167,44 @@ export class UsbDeviceChannel implements IDeviceChannel<Uint8Array, Uint8Array> 
 
     try {
       // TOOD: Add timeout in case of communication hang.
-      await this.device.transferOut(this.deviceOut.endpointNumber, commandBuffer);
-      return;
+      // transferOut wants a view over a plain ArrayBuffer. A Uint8Array is
+      // typed as possibly backed by a SharedArrayBuffer, which WebUSB rejects
+      // at runtime anyway, so narrowing here rather than copying every send.
+      const outBuffer = commandBuffer as Uint8Array<ArrayBuffer>;
+      const result = await this.device.transferOut(this.deviceOut.endpointNumber, outBuffer);
+
+      // The result was previously ignored entirely, so a stalled endpoint or a
+      // short write silently swallowed the job and the caller then waited out
+      // its full timeout for a reply that could never come.
+      if (result.status === 'stall') {
+        await this.device.clearHalt('out', this.deviceOut.endpointNumber)
+          .catch(() => { /* the device is likely gone; the error below says so */ });
+        return new DeviceCommunicationError(
+          `USB device gave 'stall' error while sending data. The endpoint has been reset, but the data was not delivered.`
+        );
+      }
+      if (result.status === 'babble') {
+        return new DeviceCommunicationError(
+          `USB device gave 'babble' error while sending data. The data was not delivered.`
+        );
+      }
+      if (result.bytesWritten !== commandBuffer.byteLength) {
+        return new DeviceCommunicationError(
+          `USB device accepted only ${String(result.bytesWritten)} of ${String(commandBuffer.byteLength)} bytes.`
+        );
+      }
+
+      // A bulk transfer whose length is an exact multiple of the endpoint's
+      // packet size needs a zero length packet to mark the end, otherwise many
+      // devices keep waiting for more and the job hangs until they time out.
+      const packetSize = this.deviceOut.packetSize;
+      if (packetSize > 0
+        && commandBuffer.byteLength > 0
+        && commandBuffer.byteLength % packetSize === 0
+      ) {
+        await this.device.transferOut(this.deviceOut.endpointNumber, new Uint8Array(0));
+      }
+      return undefined;
     } catch (e: unknown) {
       if (typeof e === 'string') {
         return new DeviceCommunicationError(e);
@@ -193,7 +233,7 @@ export class UsbDeviceChannel implements IDeviceChannel<Uint8Array, Uint8Array> 
       this.deviceIn.endpointNumber,
       getTransferLength(
         this._commOptions.maxReceivePacketSize,
-        this.deviceIn?.packetSize,
+        this.deviceIn.packetSize,
       ),
     )
     .catch((error: unknown) => {
@@ -201,8 +241,10 @@ export class UsbDeviceChannel implements IDeviceChannel<Uint8Array, Uint8Array> 
         && error.message.endsWith('A transfer error has occurred.')
         && error.name === 'NetworkError'
       ){
-        // The device disconnected, this is fine.
-        return new DeviceNotReadyError('Channel has disconnected');
+        // The exception must be forwarded: the input listener classifies a
+        // fault as transient by inspecting innerException, so dropping it here
+        // made every bus reset look fatal and stopped the listener for good.
+        return new DeviceNotReadyError('Channel has disconnected', error);
       }
       // dunno what happened
       throw error;
@@ -216,14 +258,58 @@ export class UsbDeviceChannel implements IDeviceChannel<Uint8Array, Uint8Array> 
     if (result.status === "stall") {
       // TODO: Way better error handling if this is encountered...
       console.error(`USB device gave 'stall' error on receipt of data. Automatically resetting the connection to try again. This may indicate a problem with the device.`);
-      this.device.clearHalt("in", this.deviceIn.endpointNumber);
+      // Must be awaited. Left floating, the retry is issued before the halt is
+      // actually cleared so the stall just repeats, and a rejection here (which
+      // does happen once the device is gone) becomes an unhandled rejection.
+      await this.device.clearHalt("in", this.deviceIn.endpointNumber)
+        .catch((e: unknown) => {
+          console.error('Failed to clear the halt on the USB input endpoint.', e);
+        });
+      // Whatever came back with the stall is not trustworthy data.
+      return [];
     }
     if (result.status === "babble") {
       console.error(`USB device gave 'babble' error on receipt of data. Response data was likely lost. This may indicate an issue with the device or the way this library tries to communicate to the device.`);
+      // The transfer overran, so what we have is a torn frame. Handing it up
+      // would desynchronize whatever is parsing this stream.
+      return [];
     }
     if (result.data === undefined || result.data.byteLength === 0) { return []; }
 
-    return [new Uint8Array(result.data.buffer, result.data.byteOffset, result.data.byteLength)];
+    // Copy rather than aliasing the transfer buffer, which the user agent is
+    // free to reuse once this transfer is done with.
+    return [new Uint8Array(
+      result.data.buffer.slice(
+        result.data.byteOffset,
+        result.data.byteOffset + result.data.byteLength))];
+  }
+}
+
+/**
+ * Run one of the connection steps, mapping an OS-level refusal to the
+ * actionable DriverAccessDeniedError.
+ *
+ * The driver-conflict case is NOT limited to open(). On Windows the device
+ * usually opens fine and the refusal comes from selectConfiguration or
+ * claimInterface, because usbprint.sys or a vendor driver already owns the
+ * interface. Chrome reports that as SecurityError ("Access denied") or
+ * NetworkError ("Unable to claim interface"), so without this the caller gets
+ * a bare DOMException instead of the "replace the driver" guidance.
+ */
+async function claimStep(step: () => Promise<void>, description: string) {
+  try {
+    await step();
+  } catch (e) {
+    if (e instanceof DOMException && (e.name === 'SecurityError' || e.name === 'NetworkError')) {
+      throw new DriverAccessDeniedError();
+    }
+    if (e instanceof DOMException) {
+      throw new DeviceCommunicationError(
+        `Failed to ${description} the USB device: ${e.name}: ${e.message}`,
+        e
+      );
+    }
+    throw e;
   }
 }
 
@@ -231,7 +317,7 @@ async function connectDevice(d: USBDevice) {
   // Most devices have two endpoints on one interface for bidirectional bulk
   // in and out. The more poorly performing a device the more random this
   // layout will be, so we must go and look for these two endpoints.
-  if (d.configurations[0]?.interfaces[0]?.alternates[0] === undefined) {
+  if (d.configurations.length === 0) {
     // Can't talk to the device at all???
     throw new DeviceCommunicationError(
       'USB device did not expose an endpoint to communicate with. Try power-cycling the device, or checking its settings. This is a hardware problem.'
@@ -256,16 +342,62 @@ async function connectDevice(d: USBDevice) {
     throw e;
   }
 
-  // TODO: Settings for multiple interfaces?
-  await d.selectConfiguration(1);
-  await d.claimInterface(0);
+  // selectConfiguration takes a configurationValue and claimInterface takes an
+  // interfaceNumber. Neither is an array index, so hardcoding 1 and 0 and then
+  // reading endpoints out of configurations[0].interfaces[0] mixes two
+  // different addressing spaces. On a device whose sole configuration has a
+  // configurationValue other than 1, selectConfiguration rejects outright; on a
+  // composite device whose bulk interface is not interfaceNumber 0 - very
+  // common for printers bound to WinUSB on Windows - it claims one interface
+  // and then transfers on another's endpoints, so every transferOut fails with
+  // "endpoint not part of a claimed interface".
+  const configuration = d.configuration ?? d.configurations[0];
+  if (configuration === undefined) {
+    throw new DeviceCommunicationError(
+      'USB device did not expose a configuration to communicate with. Try power-cycling the device. This is a hardware problem.'
+    );
+  }
+  if (d.configuration?.configurationValue !== configuration.configurationValue) {
+    await claimStep(
+      () => d.selectConfiguration(configuration.configurationValue),
+      'select the configuration on'
+    );
+  }
+
+  // Pick the interface that actually exposes a bulk output endpoint rather than
+  // assuming it is the first one.
+  const candidates = configuration.interfaces
+    .map(iface => ({ iface, alternate: iface.alternates[0] }))
+    .filter((c): c is { iface: USBInterface, alternate: USBAlternateInterface } =>
+      c.alternate !== undefined);
+  const chosen =
+    candidates.find(c => c.alternate.endpoints.some(e => e.direction === 'out'))
+    ?? candidates[0];
+
+  if (chosen === undefined) {
+    throw new DeviceCommunicationError(
+      'USB device did not expose an endpoint to communicate with. Try power-cycling the device, or checking its settings. This is a hardware problem.'
+    );
+  }
+
+  if (!chosen.iface.claimed) {
+    await claimStep(
+      () => d.claimInterface(chosen.iface.interfaceNumber),
+      'claim the interface on'
+    );
+  }
+
+  // Read the endpoints from the alternate that is actually active after the
+  // claim, falling back to the one we picked from the descriptor.
+  const endpoints = (chosen.iface.alternate as USBAlternateInterface | undefined)?.endpoints
+    ?? chosen.alternate.endpoints;
 
   let o: USBEndpoint | undefined = undefined;
   let i: USBEndpoint | undefined = undefined;
-  for (const endpoint of d.configurations[0].interfaces[0].alternates[0].endpoints) {
-    if (endpoint.direction == 'out') {
+  for (const endpoint of endpoints) {
+    if (endpoint.direction === 'out') {
       o = endpoint;
-    } else if (endpoint.direction == 'in') {
+    } else {
       i = endpoint;
     }
   }
@@ -294,7 +426,7 @@ if (import.meta.vitest) {
       const badDevice: USBDevice = {
         configurations: []
       } as unknown as USBDevice;
-      await expect(() => connectDevice(badDevice)).rejects.toThrowError();
+      await expect(() => connectDevice(badDevice)).rejects.toThrow();
     });
 
     it('Throws on access denied', async () => {
@@ -328,11 +460,11 @@ if (import.meta.vitest) {
 function getCommMode(output: boolean, input: boolean) {
   // TODO: Figure out if getting the Interface Protocol Mode is more
   // reliable than the detection method used here...
-  if (output === false) {
+  if (!output) {
     // Can't talk to something that isn't listening...
     return ConnectionDirectionMode.none;
   }
-  if (input === false) {
+  if (!input) {
     // Can send commands but can't get info back. Operating in the blind.
     return ConnectionDirectionMode.unidirectional;
   }
@@ -358,5 +490,6 @@ export class DriverAccessDeniedError extends DeviceCommunicationError {
     super(
       'Operating system prevented accessing the USB device. If this is on Windows you may need to replace the driver. See https://cellivar.github.io/WebZLP/docs/windows_driver for more details.'
     );
+    this.name = 'DriverAccessDeniedError';
   }
 }
